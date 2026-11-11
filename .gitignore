@@ -1,0 +1,4 @@
+candles
+*.o
+__pycache__/
+*.pyc
