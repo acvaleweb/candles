@@ -5,22 +5,43 @@ Run commands from the repository directory. The [README](README.md) describes ap
 ## Automated checks
 
 ```sh
-make
 make check
+make check-sanitize
 ```
 
-`make check` compiles and runs two C test programs:
+`make check` builds Candles, runs nine C test programs, and runs the Python helper/terminal tests. It needs a C compiler, `make`, and Python 3 with its standard library. It does not need yfinance, stock downloads, a GUI, a real interactive terminal, or third-party testing libraries. Python tests allocate their own pseudo-terminals.
+
+`make check-sanitize` rebuilds the C tests and their application modules with AddressSanitizer and UndefinedBehaviorSanitizer. Undefined behavior is fatal. This target needs compiler/runtime support for those sanitizers. It does not instrument the executable used by the Python terminal tests.
 
 | Test | Coverage |
 | --- | --- |
-| `tests/regression_math.c` | Closed-form simple OLS versus matrix fitting with standardization on/off; adjusted R², coefficient standard errors, t/F consistency, and 95% mean/prediction intervals; sparse terms, legacy masks, constant response, insufficient observations, constant x, log-y transformations, and shifted exponential/logarithmic fits. |
-| `tests/model_selection.c` | Unique term subsets for degrees 0–6, required intercept/highest terms, and repeated cancellation/reopening/selection through the real generation path. |
+| `tests/regression_math.c` | Closed-form OLS versus matrix fitting; standardization, adjusted R², coefficient tests, overall F test, mean/prediction intervals, sparse/legacy masks, log-y transformations, invalid fits, and shifted families. Links only the numerical object and `-lm`. |
+| `tests/model_selection.c` | Unique subsets for degrees 0–6, required terms, and repeated cancel/reopen/select cycles with menu/persistence doubles. |
+| `tests/io.c` | Stock delimiters, decimal commas, BOM, sorting, invalid numeric rows, OHLC normalization, append/newline handling, replacement failure cleanup, folder scanning, calendar aggregation, live reference aggregation, and data-import naming/zero values. |
+| `tests/indicators.c` | Moving averages, population-standard-deviation Bollinger bands, Wilder RSI, classic shape/volume direction, binary strategy thresholds and wick/band boundaries, warmup blanks, and exported binary zeroes. |
+| `tests/state.c` | Settings defaults/validation, paths with spaces, configuration preservation, independent ticker profiles, malformed profiles, regression form storage, standardization, and remembered strategy. |
+| `tests/diagnostics.c` | Residual variance, lag-1 and Durbin–Watson statistics, Shapiro–Wilk properties, histogram density normalization during zoom/pan, and evenly spaced axis values. |
+| `tests/input_live.c` | Prompt insertion, UTF-8 cursor/backspace behavior, full buffers, live OHLC normalization, stale readings, and preservation of the reference values used for scales. |
+| `tests/grabber.c` | Fragmented helper messages, split replacement, session states, errors/EOF, and real child startup/shutdown with a local fake helper. |
+| `tests/regression_pipeline.c` | Independent x/y change periods/directions, percentage/absolute/log returns, zero filters, sampled endpoints for either/both axes, month/year thinning with Time, weekend prior-close matching on either stock axis, form roundtrips, all eight legacy/current graph versions, sparse model persistence, and corrupt graph rejection. |
+| `tests/test_helper.py` | Offline Yahoo-helper doubles: split/refetch versus append, date limits, empty history, pre/regular/post session boundaries, extended-hours OHLC, and error formatting. |
+| `tests/test_terminal.py` | Actual executable through a PTY: search, menu wrapping, mouse selection, measurement/cancellation, resizing, candidate cancellation/reopening, graph panels and pan, residual focus, prediction intervals, filename cursor editing, saving, and terminal-mode restoration. |
 
-The numerical test links only `regression_math.o` and `-lm`. The selection integration test substitutes menu and state calls, uses a temporary date/value fixture, and does not read or write user configuration. Its source includes `regression.c` to reach private functions.
+C file fixtures live in private temporary directories. Tests that use real persistence set a private `HOME`; the original selection test substitutes state calls. Python terminal tests also use private homes and data folders. No test contacts Yahoo or modifies the user's data/settings. Temporary fixtures are cleaned up on normal test completion and handled check failures.
 
-Passing these checks does not establish every statistical approximation, exhaustive-search metric, legacy graph version, terminal/font behavior, or live Yahoo response. Manual scenarios below are checks to perform, not a claim that they have all passed.
+Generated objects/binaries live under ignored `tests/bin/`; sanitizer outputs use `tests/bin/sanitize/`. `make clean` removes these, the application executable/objects, and older test binaries. Tests explicitly keep assertions enabled even if normal build flags contain `-DNDEBUG`.
 
-Build products, including the two test executables, are ignored by Git. `make clean` removes the executable, object files, and test executables.
+For a subset or another compiler:
+
+```sh
+make check-c
+make check-python
+make CC=clang TEST_BUILD=tests/bin/clang check-c
+```
+
+Run `make clean` before changing compiler/build flags in an existing build directory. Tests stop the command with a nonzero exit status on failure. The [GitHub Actions workflow](.github/workflows/tests.yml) runs the full suite and C sanitizers with GCC and Clang on pushes and pull requests; it does not change branch-protection settings.
+
+These checks protect the specified behaviors, not every input, numerical approximation, external API response, font, or terminal implementation. Shapiro tests check analytic small cases and invariants; they are not a complete external validation of every p-value. High-degree model search and every nonlinear candidate-scoring policy are not exhaustively validated.
 
 ## Manual regression checks
 

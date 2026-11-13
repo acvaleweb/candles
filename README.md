@@ -56,7 +56,7 @@ make clean
 make
 ```
 
-Run the automated checks with `make check`; see [TESTING_GUIDE.md](TESTING_GUIDE.md) for coverage and manual checks.
+Run the automated suite with `make check` and the C memory/undefined-behavior checks with `make check-sanitize`. Tests require Python 3 with its standard library; yfinance is unnecessary. See [TESTING_GUIDE.md](TESTING_GUIDE.md) for coverage, isolation, and manual checks.
 
 Run the program in a terminal, not through an output pipe. Choose data folders inside the application with `f`; there is no command-line CSV/folder selection interface.
 

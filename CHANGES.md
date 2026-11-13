@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Expand `make check` to nine C programs plus offline helper and real-terminal tests. Cover CSV/data IO, indicators and strategies, settings, live updates, residual diagnostics, regression sampling and graph persistence.
+- Add `make check-sanitize` with fatal address/undefined-behavior checks and isolated test build outputs.
+- Add GitHub Actions checks for GCC and Clang on pushes and pull requests.
+
 - Extract regression fitting, evaluation, statistical tests, and intervals into a numerical module with no terminal or configuration dependencies. Preserve calculation algorithms and selection behavior.
 - Add standalone numerical checks against closed-form OLS, coefficient tests, mean/prediction intervals, sparse models, log-y transformations, and shifted-family fits.
 - Consolidate regression usage into README, add an architecture guide, and correct the testing instructions. Remove overlapping implementation reports and unverified performance estimates.

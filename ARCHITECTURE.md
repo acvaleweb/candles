@@ -16,7 +16,7 @@ Regression generation reloads the selected daily CSV/data files. `regression.c` 
 
 The extraction preserves the existing algorithms: normal equations for polynomial fitting, damped nonlinear least squares for shifted families, and Jacobian-based nonlinear inference. It does not change standardization, model selection, graph formats, or settings formats. Log-y coefficient tests operate on the fitted log-response scale; interval routines retain their existing log-to-original-scale transformations.
 
-`tests/regression_math.c` links only the numerical object and the math library. The integration test in `tests/model_selection.c` still includes the regression implementation to reach private search/configuration functions and replaces menu/persistence calls with test doubles.
+`tests/regression_math.c` links only the numerical object and the math library. Integration tests in `tests/model_selection.c` and `tests/regression_pipeline.c` include the regression implementation to reach private search, preparation, and persistence functions. The selection test replaces menu/state calls; the pipeline test uses real persistence in a temporary home. The wider suite also exercises modules directly and drives the real app through pseudo-terminals; see [TESTING_GUIDE.md](TESTING_GUIDE.md).
 
 ## Model selection and persistence
 

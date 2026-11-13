@@ -2,6 +2,7 @@
 /candles
 /tests/model_selection
 /tests/regression_math
+/tests/bin/
 
 # Compiler and coverage output
 *.o
