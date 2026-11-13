@@ -2,7 +2,9 @@
 
 Candles is a keyboard-driven terminal application for viewing stock candlesticks, fetching price data, displaying indicators, and exploring relationships with polynomial regression graphs.
 
-This manual describes **version 0.3.27**.
+This manual describes **version 4.1**.
+
+Version 4.1 fixes duplicate models in the candidate picker and makes Esc cancel selection cleanly back to the stock viewer. Run `make check` for the model-selection regression checks.
 
 ## Contents
 

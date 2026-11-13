@@ -2,3 +2,4 @@ candles
 *.o
 __pycache__/
 *.pyc
+tests/model_selection

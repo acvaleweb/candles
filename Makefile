@@ -12,5 +12,10 @@ $(TARGET): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(TARGET)
+	rm -f tests/model_selection
 
-.PHONY: clean
+check: $(OBJ)
+	$(CC) $(CFLAGS) -I. tests/model_selection.c $(filter-out main.o regression.o,$(OBJ)) -lm -o tests/model_selection
+	./tests/model_selection
+
+.PHONY: clean check

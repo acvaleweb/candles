@@ -912,6 +912,28 @@ static void describe_graph(const StockList *list, const Spec *s, RegressionGraph
 }
 
 /* Failure belongs to this candidate, not to the whole degree search. */
+typedef struct {
+    RegressionModel model;
+    double aic, cp, r2_adj, sse;
+    int degree, param_count;
+    unsigned terms;
+    double *fit;
+} ModelCandidate;
+
+/* Calculate AIC for a model. Lower is better. */
+static double calculate_aic(int n, int p, double sse)
+{
+    if(n<=p||sse<=0||!isfinite(sse))return INFINITY;
+    return n*log(sse/n)+2*p;
+}
+
+/* Calculate Cp of Mallows. Lower is better. */
+static double calculate_cp(int n, int p, double sse, double sigma2_full)
+{
+    if(sigma2_full<=0||!isfinite(sse)||!isfinite(sigma2_full))return INFINITY;
+    return sse/sigma2_full-(n-2*p);
+}
+
 static int apply_significance(const double *x,const double *y,int n,const Spec *sp,
                               int *degree,double *pred,double *score,RegressionModel *model)
 {
@@ -941,6 +963,188 @@ static int apply_significance(const double *x,const double *y,int n,const Spec *
     return 0;
 }
 
+/* Calculate SSE for model on the appropriate scale (for log_y models, SSE is on log scale) */
+static double calculate_model_sse(const double *x, const double *y, int n, 
+                                  const RegressionModel *model, int degree, int logy)
+{
+    double sse=0;
+    for(int i=0;i<n;i++) {
+        double yval=logy?log(y[i]):y[i];
+        if(!isfinite(yval))return INFINITY;
+        
+        /* Evaluate model prediction on transformed scale */
+        double z=(x[i]-model->mean)/model->scale;
+        double fit=0;
+        for(int j=0;j<=degree;j++) {
+            if(model->terms&(1u<<j)) {
+                fit+=model->coefficients[j]*pow(z,j);
+            }
+        }
+        
+        if(!isfinite(fit))return INFINITY;
+        double resid=yval-fit;
+        sse+=resid*resid;
+    }
+    return sse;
+}
+
+/* Perform exhaustive model selection for a given degree.
+ * Returns array of candidates and count via out parameters. */
+static int exhaustive_search(const double *x, const double *y, int n, const Spec *sp,
+                             int degree, double sigma2_full, ModelCandidate **out_candidates, int *out_count)
+{
+    if(degree<0||degree>25)return -1;
+    
+    /* For degree 0, only one model (intercept only) */
+    if(degree==0) {
+        ModelCandidate *candidates=malloc(sizeof(ModelCandidate));
+        if(!candidates)return -1;
+        
+        double *trial_fit=malloc((size_t)n*sizeof(double));
+        if(!trial_fit){free(candidates);return -1;}
+        
+        double score;
+        RegressionModel trial_model;
+        unsigned terms=1u; /* Only intercept */
+        
+        if(fit_family(x,y,n,0,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
+                     trial_fit,&score,&trial_model)) {
+            free(trial_fit);free(candidates);
+            *out_candidates=NULL;*out_count=0;
+            return 0;
+        }
+        
+        int param_count=1;
+        if(sp->family)param_count++;
+        double sse=calculate_model_sse(x,y,n,&trial_model,0,!sp->family&&sp->log_y);
+        
+        if(!isfinite(sse)||n<=param_count){free(trial_fit);free(candidates);*out_candidates=NULL;*out_count=0;return 0;}
+        
+        candidates[0].model=trial_model;
+        candidates[0].aic=calculate_aic(n,param_count,sse);
+        candidates[0].cp=calculate_cp(n,param_count,sse,sigma2_full);
+        candidates[0].r2_adj=score;
+        candidates[0].sse=sse;
+        candidates[0].degree=0;
+        candidates[0].param_count=param_count;
+        candidates[0].terms=terms;
+        candidates[0].fit=trial_fit;
+        
+        *out_candidates=candidates;
+        *out_count=1;
+        return 0;
+    }
+    
+    /* Generate all possible term combinations for degree > 0 */
+    unsigned base_terms=1u<<degree; /* Must include highest degree */
+    int max_models=1<<(degree-1); /* Only powers 1 .. degree-1 are optional. */
+    
+    ModelCandidate *candidates=malloc((size_t)max_models*sizeof(ModelCandidate));
+    if(!candidates)return -1;
+    
+    int count=0;
+    
+    /* Try all subsets that include intercept (term 0) and highest degree term */
+    for(unsigned subset=0;subset<(1u<<(degree-1));subset++) {
+        /* Always include intercept (bit 0) and highest degree (bit 'degree') */
+        unsigned terms=base_terms|(subset<<1)|1u;
+        
+        /* Count parameters */
+        int param_count=0;
+        for(int j=0;j<=degree;j++)if(terms&(1u<<j))param_count++;
+        if(sp->family)param_count++; /* Add 1 for shift parameter in nonlinear families */
+        
+        if(n<=param_count)continue; /* Not enough data */
+        
+        /* Fit the model */
+        double *trial_fit=malloc((size_t)n*sizeof(double));
+        if(!trial_fit){free(candidates);return -1;}
+        
+        double score;
+        RegressionModel trial_model;
+        if(fit_family(x,y,n,degree,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
+                     trial_fit,&score,&trial_model)) {
+            free(trial_fit);
+            continue;
+        }
+        
+        /* Calculate SSE on the appropriate scale */
+        double sse=calculate_model_sse(x,y,n,&trial_model,degree,!sp->family&&sp->log_y);
+        
+        if(!isfinite(sse)){free(trial_fit);continue;}
+        
+        /* Calculate AIC and Cp */
+        double aic=calculate_aic(n,param_count,sse);
+        double cp=calculate_cp(n,param_count,sse,sigma2_full);
+        
+        /* Store candidate */
+        candidates[count].model=trial_model;
+        candidates[count].aic=aic;
+        candidates[count].cp=cp;
+        candidates[count].r2_adj=score;
+        candidates[count].sse=sse;
+        candidates[count].degree=degree;
+        candidates[count].param_count=param_count;
+        candidates[count].terms=terms;
+        candidates[count].fit=trial_fit;
+        count++;
+    }
+    
+    *out_candidates=candidates;
+    *out_count=count;
+    return 0;
+}
+
+/* Comparison function for sorting candidates by AIC */
+static int compare_by_aic(const void *a, const void *b)
+{
+    const ModelCandidate *ca=(const ModelCandidate*)a;
+    const ModelCandidate *cb=(const ModelCandidate*)b;
+    if(ca->aic<cb->aic)return -1;
+    if(ca->aic>cb->aic)return 1;
+    /* Tie-break by parameter count (prefer simpler) */
+    if(ca->param_count<cb->param_count)return -1;
+    if(ca->param_count>cb->param_count)return 1;
+    return 0;
+}
+
+/* Present model selection menu and return user's choice */
+static int select_model_menu(const Settings *cfg, DrawFn draw, void *ctx,
+                            ModelCandidate *candidates, int count)
+{
+    if(count==0)return -1;
+    
+    /* Build menu items */
+    char **items=malloc((size_t)(count+1)*sizeof(char*));
+    if(!items)return -1;
+    
+    /* Find lowest AIC for delta calculation */
+    double min_aic=candidates[0].aic;
+    
+    for(int i=0;i<count;i++) {
+        items[i]=malloc(256);
+        if(!items[i]) {
+            for(int j=0;j<i;j++)free(items[j]);
+            free(items);
+            return -1;
+        }
+        double aic_delta=candidates[i].aic-min_aic;
+        snprintf(items[i],256,"AIC %.4g (Δ %.4g) | p=%d | adj-R² %.4g",
+                candidates[i].aic,aic_delta,candidates[i].param_count,
+                candidates[i].r2_adj);
+    }
+    
+    items[count]=NULL;
+    
+    int selected=menu_pick_existing(cfg,draw,ctx,"Select model",items,count,0);
+    
+    for(int i=0;i<count;i++)free(items[i]);
+    free(items);
+    
+    return selected;
+}
+
+/* 0: graph produced, 1: cancelled, -1: error. */
 static int generate(const Settings *cfg, DrawFn draw, void *ctx, const StockList *l, Spec *sp, char *err, size_t errn, RegressionGraph *g)
 {
     (void)cfg;(void)draw;(void)ctx;
@@ -1038,23 +1242,149 @@ static int generate(const Settings *cfg, DrawFn draw, void *ctx, const StockList
     free(selected_dates);free(selected_x);free(selected_y);
     data_free(&union_dates);
     stock_free(&xs);stock_free(&ys);data_free(&xd);data_free(&yd); if(n<4){free(x);free(y);snprintf(err,errn,"Not enough matching observations");return -1;}
-    double *best=malloc((size_t)n*sizeof*best),*trial=malloc((size_t)n*sizeof*trial);if(!best||!trial){free(x);free(y);free(best);free(trial);snprintf(err,errn,"Out of memory");return -1;}double bestscore=-INFINITY;int bestd=0;
-    RegressionModel best_model={0};int found=0,failed_tests=0;
-    for(int d=sp->exact_degree||sp->max_degree==0?sp->max_degree:1;d<=sp->max_degree;d++) {
-        double score;RegressionModel trial_model;int degree=d;
-        if(fit_family(x,y,n,d,!sp->family&&sp->log_y,(1u<<(d+1))-1,sp->family,sp->standardize,trial,&score,&trial_model))continue;
-        if(apply_significance(x,y,n,sp,&degree,trial,&score,&trial_model)){failed_tests++;continue;}
-        if(!found||(isfinite(score)&&(!isfinite(bestscore)||score>bestscore))) {
-            found=1;bestscore=score;bestd=degree;best_model=trial_model;memcpy(best,trial,(size_t)n*sizeof*best);
+    
+    double *best=NULL;
+    RegressionModel best_model={0};
+    int bestd=0;
+    double bestscore=-INFINITY;
+    
+    /* Use exhaustive search if exact_degree is not set */
+    if(!sp->exact_degree) {
+        /* First fit full model at max_degree to get sigma2 for Cp calculation */
+        double *full_fit=malloc((size_t)n*sizeof(double));
+        if(!full_fit){free(x);free(y);snprintf(err,errn,"Out of memory");return -1;}
+        
+        RegressionModel full_model;
+        double full_score;
+        unsigned full_terms=(1u<<(sp->max_degree+1))-1;
+        
+        if(fit_family(x,y,n,sp->max_degree,!sp->family&&sp->log_y,full_terms,sp->family,
+                     sp->standardize,full_fit,&full_score,&full_model)) {
+            free(full_fit);free(x);free(y);
+            snprintf(err,errn,"Cannot fit full model for exhaustive search");
+            return -1;
+        }
+        
+        double full_sse=calculate_model_sse(x,y,n,&full_model,sp->max_degree,!sp->family&&sp->log_y);
+        int full_params=sp->max_degree+1; /* All terms from 0 to max_degree */
+        if(sp->family)full_params++; /* Add shift parameter for nonlinear families */
+        
+        if(n<=full_params||!isfinite(full_sse)||full_sse<=0) {
+            free(full_fit);free(x);free(y);
+            snprintf(err,errn,"Full model has no residual variance for Cp calculation");
+            return -1;
+        }
+        
+        double sigma2_full=full_sse/(n-full_params);
+        free(full_fit);
+        
+        /* Collect all candidates from all degrees */
+        ModelCandidate *all_candidates=NULL;
+        int total_count=0,total_capacity=0;
+        
+        int min_degree=sp->max_degree==0?0:1;
+        for(int d=min_degree;d<=sp->max_degree;d++) {
+            ModelCandidate *degree_candidates=NULL;
+            int degree_count=0;
+            
+            if(exhaustive_search(x,y,n,sp,d,sigma2_full,&degree_candidates,&degree_count)) {
+                /* Failed to search this degree, skip it */
+                continue;
+            }
+            
+            /* Filter by Cp < p */
+            for(int i=0;i<degree_count;i++) {
+                if(degree_candidates[i].cp>=degree_candidates[i].param_count) {
+                    free(degree_candidates[i].fit);
+                    continue;
+                }
+                
+                /* Add to collection */
+                if(total_count==total_capacity) {
+                    int new_cap=total_capacity?total_capacity*2:16;
+                    ModelCandidate *tmp=realloc(all_candidates,(size_t)new_cap*sizeof(ModelCandidate));
+                    if(!tmp) {
+                        for(int j=0;j<total_count;j++)free(all_candidates[j].fit);
+                        free(all_candidates);
+                        free(degree_candidates);
+                        free(x);free(y);
+                        snprintf(err,errn,"Out of memory");
+                        return -1;
+                    }
+                    all_candidates=tmp;
+                    total_capacity=new_cap;
+                }
+                all_candidates[total_count++]=degree_candidates[i];
+            }
+            
+            free(degree_candidates);
+        }
+        
+        if(total_count==0) {
+            free(all_candidates);free(x);free(y);
+            snprintf(err,errn,"No models with Cp < p found");
+            return -1;
+        }
+        
+        /* Sort by AIC */
+        qsort(all_candidates,(size_t)total_count,sizeof(ModelCandidate),compare_by_aic);
+        
+        /* Take top 10 */
+        int menu_count=total_count<10?total_count:10;
+        ModelCandidate *menu_candidates=all_candidates; /* First 10 */
+        
+        /* Present selection menu */
+        int selected=select_model_menu(cfg,draw,ctx,menu_candidates,menu_count);
+        
+        if(selected<0||selected>=menu_count) {
+            /* User cancelled */
+            for(int i=0;i<total_count;i++)free(all_candidates[i].fit);
+            free(all_candidates);free(x);free(y);
+            return 1;
+        }
+        
+        /* Use selected model */
+        best_model=all_candidates[selected].model;
+        bestd=all_candidates[selected].degree;
+        bestscore=all_candidates[selected].r2_adj;
+        best=all_candidates[selected].fit;
+        all_candidates[selected].fit=NULL; /* Take ownership */
+        
+        /* Free other candidates */
+        for(int i=0;i<total_count;i++)
+            if(i!=selected&&all_candidates[i].fit)free(all_candidates[i].fit);
+        free(all_candidates);
+        
+    } else {
+        /* exact_degree is set - use old behavior */
+        double *trial=malloc((size_t)n*sizeof(double));
+        best=malloc((size_t)n*sizeof(double));
+        if(!best||!trial){free(x);free(y);free(best);free(trial);snprintf(err,errn,"Out of memory");return -1;}
+        
+        int found=0,failed_tests=0;
+        for(int d=sp->exact_degree||sp->max_degree==0?sp->max_degree:1;d<=sp->max_degree;d++) {
+            double score;RegressionModel trial_model;int degree=d;
+            if(fit_family(x,y,n,d,!sp->family&&sp->log_y,(1u<<(d+1))-1,sp->family,sp->standardize,trial,&score,&trial_model))continue;
+            if(apply_significance(x,y,n,sp,&degree,trial,&score,&trial_model)){failed_tests++;continue;}
+            if(!found||(isfinite(score)&&(!isfinite(bestscore)||score>bestscore))) {
+                found=1;bestscore=score;bestd=degree;best_model=trial_model;memcpy(best,trial,(size_t)n*sizeof*best);
+            }
+        }
+        free(trial);
+        if(!found) {
+            free(x);free(y);free(best);
+            snprintf(err,errn,sp->exact_degree?"Cannot fit requested degree: insufficient points or singular model":
+                     failed_tests?"No candidate has usable significance tests":"No valid regression (insufficient points or singular models)");
+            return -1;
         }
     }
-    free(trial);
-    if(!found) {
-        free(x);free(y);free(best);
-        snprintf(err,errn,sp->exact_degree?"Cannot fit requested degree: insufficient points or singular model":
-                 failed_tests?"No candidate has usable significance tests":"No valid regression (insufficient points or singular models)");
+    
+    if(!best) {
+        free(x);free(y);
+        snprintf(err,errn,"No model selected");
         return -1;
     }
+    
     regression_graph_free(g);g->x=x;g->y=y;g->fit=best;g->count=n;g->degree=bestd;g->adjusted_r2=bestscore;
     g->model=best_model;
     g->significance=sp->significance;
@@ -1359,7 +1689,8 @@ int regression_menu(const Settings *cfg, DrawFn draw, void *ctx, const StockList
     char *actions[]={"Generate regression","Open graph"};int action=menu_select(cfg,draw,ctx,"Graphs",actions,2,0);if(action<0)return 0;
     if(action==1) return open_graph(cfg, draw, ctx, l, err, errn, g);
     Spec s={0};if(!configure(cfg,draw,ctx,l,&s))return 0;
-    return generate(cfg,draw,ctx,l,&s,err,errn,g)==0?1:-1;
+    int result=generate(cfg,draw,ctx,l,&s,err,errn,g);
+    return result==0?1:result==1?0:-1;
 }
 
 static void add_dot(unsigned char *mask, int width, int height, int px, int py)

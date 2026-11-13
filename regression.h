@@ -33,7 +33,8 @@ typedef struct {
 void regression_graph_free(RegressionGraph *graph);
 
 /* Shows the g menu. It can generate a graph from the CSV folder or open a
- * saved graph. On success graph is filled for regression_view(). */
+ * saved graph. Returns 1 with a graph ready for regression_view(), 0 on
+ * cancellation, or -1 on error. */
 int regression_menu(const Settings *cfg, DrawFn draw, void *ctx, const StockList *list,
                     char *err, size_t errn, RegressionGraph *graph);
 
