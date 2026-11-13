@@ -1,262 +1,70 @@
-# Testing Guide for Exhaustive Model Selection
+# Testing Candles
 
-## Prerequisites
+Run commands from the repository directory. The [README](README.md) describes application controls; [ARCHITECTURE.md](ARCHITECTURE.md) describes module boundaries.
 
-1. Compile the program:
-   ```bash
-   cd /home/toaster/candles
-   make
-   ```
+## Automated checks
 
-2. Ensure you have stock CSV data or test data available
+```sh
+make
+make check
+```
 
-## Test Scenarios
+`make check` compiles and runs two C test programs:
 
-### Test 1: Basic Exhaustive Search (Polynomial)
+| Test | Coverage |
+| --- | --- |
+| `tests/regression_math.c` | Closed-form simple OLS versus matrix fitting with standardization on/off; adjusted R², coefficient standard errors, t/F consistency, and 95% mean/prediction intervals; sparse terms, legacy masks, constant response, insufficient observations, constant x, log-y transformations, and shifted exponential/logarithmic fits. |
+| `tests/model_selection.c` | Unique term subsets for degrees 0–6, required intercept/highest terms, and repeated cancellation/reopening/selection through the real generation path. |
 
-**Objective**: Verify exhaustive search generates and presents model candidates
+The numerical test links only `regression_math.o` and `-lm`. The selection integration test substitutes menu and state calls, uses a temporary date/value fixture, and does not read or write user configuration. Its source includes `regression.c` to reach private functions.
 
-**Steps**:
-1. Launch `./candles`
-2. Load a folder with stock CSV files
-3. Press `g` to open regression menu
-4. Select "Generate regression"
-5. Configure:
-   - Choose Y variable (e.g., a stock)
-   - Choose X variable (e.g., Time or another stock)
-   - Set "Maximum polynomial degree" to 3 or 4
-   - Ensure "fit exactly this degree" is NOT checked (unchecked = exhaustive search)
-6. Select "Generate regression"
+Passing these checks does not establish every statistical approximation, exhaustive-search metric, legacy graph version, terminal/font behavior, or live Yahoo response. Manual scenarios below are checks to perform, not a claim that they have all passed.
 
-**Expected Results**:
-- A menu should appear titled "Select model"
-- Should show up to 10 models
-- Each entry shows: `AIC <value> (Δ <delta>) | p=<params> | adj-R² <score>`
-- Models should be sorted by AIC (ascending)
-- First model should have lowest AIC
-- All models should have Cp < p (implicitly, they passed the filter)
+Build products, including the two test executables, are ignored by Git. `make clean` removes the executable, object files, and test executables.
 
-**Verify**:
-- AIC values increase down the list
-- Delta values show difference from top model
-- Parameter counts (p) vary
-- Can select any model and it generates a valid graph
+## Manual regression checks
 
----
+Use disposable CSVs and data folders. Different checkouts share settings under `HOME` and can update the same CSVs. To isolate manual testing, create a temporary home and launch with it:
 
-### Test 2: Sparse Term Models
+```sh
+candles_test_home=$(mktemp -d)
+HOME="$candles_test_home" ./candles
+```
 
-**Objective**: Verify models with missing intermediate terms
+Choose a test data folder inside the application. Leave live mode off unless testing the helper deliberately.
 
-**Steps**:
-1. Same setup as Test 1
-2. Set "Maximum polynomial degree" to 5
-3. Generate regression
+### Candidate selection and cancellation
 
-**Expected Results**:
-- Some models should have non-consecutive terms
-- Example: A degree-5 model might include {0, 2, 5} but not {1, 3, 4}
-- These models should fit successfully
-- Graph should display correctly with sparse coefficients
+1. Choose overlapping variables with at least four pairs, variation in x, and a noisy relationship. Select the polynomial family, maximum degree 3, and leave exact-degree fitting unchecked.
+2. Generate. If candidates pass the Cp filter, verify the picker shows at most ten candidates, sorted by nondecreasing AIC; equal AIC is allowed. At degree 3 there are at most seven subsets across degrees 1–3 before filtering.
+3. Press Esc from the picker. Verify the stock viewer is usable; reopen `g` and generate again.
+4. Select a candidate, then press `p`. Verify the displayed equation matches the retained terms and the graph is usable. Similar rounded menu metrics alone do not prove two models are duplicates.
 
-**Verify**:
-- Press `t` in the regression viewer to see coefficient tests
-- Some beta coefficients should be listed as "removed"
-- The equation display should show the included terms only
+Datasets are not guaranteed to produce ten candidates, sparse models, or any candidate passing Cp. The full reference fit may also fail before the picker opens. Record the data and settings when investigating an unexpected result.
 
----
+### Exact degree and inference
 
-### Test 3: exact_degree Bypass
+1. Enable exact-degree fitting and choose degree 3. Leave alpha empty; generate and verify there is no candidate picker and all four polynomial terms remain.
+2. Set alpha and enable intermediate-term removal. Generate and inspect `p`: the highest power and intercept stay, while lower powers may be removed. P-values at or below alpha are green and those above it are red; unavailable values remain uncolored.
+3. In exact mode, test degree 0 and degree 1. Verify constant and straight-line fits respectively. A degree-1 model has no removable intermediate slopes.
+4. Toggle standardization and compare full polynomial predictions. Coefficient values and intercept p-values can change with the basis even when the curve agrees.
+5. For a positive response, test log-y. The equation/test scale should be logarithmic while the plotted response stays on its original scale.
+6. Test shifted exponential and shifted logarithmic families at low degrees. Verify successful curves, the shift in `p`, and graceful errors for unsuitable inputs. Nonlinear inference is approximate.
 
-**Objective**: Verify old behavior is preserved when exact_degree is enabled
+### Alignment and change sampling
 
-**Steps**:
-1. Launch regression generator
-2. Configure variables
-3. Set "Maximum polynomial degree" to 3
-4. Enable "[x] fit exactly this degree" checkbox
-5. Generate regression
+Use small date/value files where endpoints can be checked by hand. Cover forward/backward changes, closest point versus calendar-day horizon, all observations versus sampled endpoints, independent x/y periods, and percentage/absolute/log returns. Include a weekend, a missing trading date, a zero starting value, and the x/y zero-change filters. Verify previous-close matching never uses a future stock close.
 
-**Expected Results**:
-- NO menu should appear
-- Should directly generate the regression for degree 3
-- Uses old R²-based selection (or the only full model)
+### Viewers and saved graphs
 
-**Verify**:
-- No model selection menu
-- Goes straight to graph view
-- All terms from 0 to 3 are included
+- Save with `s`, edit the proposed filename using arrows, and reopen through `g` → Open graph. Verify points, fitted curve, retained terms, and the saved significance cutoff.
+- Toggle `p` and `i`; verify they exclude each other, pan/zoom still works, and clicks inside the panel do not select graph coordinates.
+- Test residuals with `h`, focus switching with `j`, histogram visibility with `n`, and line visibility with `k`. Check pan/zoom and the residual x-axis toggle `t`.
+- Test `b` mean-response bands and `e` conditional histogram. Inside `e`, test `p` prediction intervals and `m` observation-window changes.
+- Resize at small and large terminal sizes. Check axes, panel clipping, and Braille line/point layering.
 
----
+## Recording failures and performance
 
-### Test 4: Different Model Families
+Include the model family, maximum/exact degree, standardization, alpha, sampling/change settings, accepted point count, and a reproducible data fixture. Distinguish fitting errors from unavailable inference and from cancelled menus.
 
-**Objective**: Test exhaustive search with nonlinear families
-
-**Steps**:
-1. Setup regression generation
-2. Set "Model family" to "shifted exponential"
-3. Set max degree to 2 or 3
-4. Generate (with exact_degree unchecked)
-
-**Expected Results**:
-- Menu appears with candidates
-- Parameter counts include the shift parameter (+1)
-- Models fit exponential curves
-- Selection works correctly
-
-**Repeat for**: "shifted logarithmic" family
-
----
-
-### Test 5: Cp < p Filtering
-
-**Objective**: Verify only models with Cp < p are presented
-
-**Steps**:
-1. Use a dataset with weak relationships (high noise)
-2. Set max degree high (e.g., 7)
-3. Generate regression
-
-**Expected Results**:
-- Menu may have fewer than 10 models (if many fail Cp < p)
-- Message "No models with Cp < p found" if all fail the criterion
-- Selected models should be reasonable (not overfitted)
-
-**To inspect Cp values** (optional code modification for testing):
-- Temporarily modify select_model_menu() to also display Cp values
-- Verify all displayed Cp < p
-
----
-
-### Test 6: Edge Cases
-
-#### Test 6a: max_degree = 0
-**Steps**:
-1. Set max degree to 0 (constant model)
-2. Generate
-
-**Expected**: Single model (intercept only) with appropriate AIC
-
-#### Test 6b: max_degree = 1
-**Steps**:
-1. Set max degree to 1
-2. Generate
-
-**Expected**: Single or two models (maybe just intercept and x^1)
-
-#### Test 6c: Insufficient Data
-**Steps**:
-1. Use very small dataset (e.g., 5-10 points)
-2. Set high max degree (e.g., 8)
-
-**Expected**: 
-- Error message about insufficient points or singular models
-- Graceful handling (no crash)
-
----
-
-### Test 7: Integration with Existing Features
-
-**Objective**: Verify exhaustive search works with other features
-
-#### Test 7a: With Significance Testing
-**Steps**:
-1. Set significance alpha (e.g., 0.05)
-2. Enable "remove insignificant intermediate terms"
-3. Generate with exact_degree enabled
-
-**Expected**: Old significance-based term removal still works
-
-#### Test 7b: Graph Saving
-**Steps**:
-1. Generate with exhaustive search
-2. Select a sparse model
-3. Press `s` to save graph
-4. Name and save
-5. Open the saved graph later
-
-**Expected**:
-- Graph saves successfully
-- Reopening shows correct model with sparse terms
-- Residuals and tests work correctly
-
-#### Test 7c: Log Transformations
-**Steps**:
-1. Enable "[x] log y"
-2. Generate with exhaustive search
-
-**Expected**:
-- SSE calculated in log space
-- AIC and Cp correct
-- Model selection menu appears
-- Selected model works in residual viewer
-
----
-
-## Manual Verification Checklist
-
-For each test, verify:
-
-- [ ] No compilation warnings
-- [ ] No crashes or segfaults
-- [ ] Menu displays correctly
-- [ ] AIC values are reasonable (not NaN or Inf)
-- [ ] User can navigate menu with arrow keys
-- [ ] Selected model creates valid graph
-- [ ] Graph displays scatter plot and fitted curve
-- [ ] Coefficient tests panel shows correct terms
-- [ ] Residual analysis works
-- [ ] Graph can be saved
-- [ ] Saved graph can be reopened
-
-## Expected Performance
-
-**Timing estimates** (on modern hardware):
-- Degree 3: < 0.1 seconds
-- Degree 5: < 0.5 seconds  
-- Degree 7: < 2 seconds
-- Degree 10: < 10 seconds (with ~1000 data points)
-
-If performance is slower, consider:
-- Dataset size (more observations → longer fitting)
-- Nonlinear families (exponential/log are slower)
-- Number of candidate models generated
-
-## Troubleshooting
-
-### Issue: "No models with Cp < p found"
-**Cause**: All models have poor fit (Cp >= p)
-**Solutions**:
-- Try lower max degree
-- Check data quality
-- Use different variables
-
-### Issue: Menu doesn't appear
-**Cause**: exact_degree is enabled
-**Solution**: Uncheck "fit exactly this degree"
-
-### Issue: Very similar AIC values
-**Cause**: Models fit similarly well
-**Normal**: AIC delta < 2 means models are competitive; choose based on simplicity
-
-### Issue: Crashes during generation
-**Cause**: Likely memory issue or invalid data
-**Check**:
-- Sufficient RAM for large degree
-- No NaN or Inf values in data
-- Dataset has > 4 observations
-
-## Validation Criteria
-
-Implementation is successful if:
-1. ✓ Compiles without errors
-2. ✓ Exhaustive search generates candidates
-3. ✓ Menu presents top 10 by AIC
-4. ✓ Cp < p filter works
-5. ✓ Selected models create valid graphs
-6. ✓ exact_degree bypass preserved
-7. ✓ Works with all model families
-8. ✓ No memory leaks (use valgrind if available)
-9. ✓ Graphs save and reload correctly
-10. ✓ Integration with existing features maintained
+Measure timings and memory on the actual dataset and hardware. Exhaustive search tries `2^(d−1)` subsets at each positive degree d and currently stores all successful candidates' predictions before choosing ten. The UI's degree cap of 25 is not a practical exhaustive-search guarantee. Avoid high-degree performance tests without accounting for that cost; nonlinear fits add iterative work per candidate.

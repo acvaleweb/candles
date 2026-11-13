@@ -1,4 +1,5 @@
 #include "regression.h"
+#include "regression_math.h"
 
 #include "data.h"
 #include "scale.h"
@@ -21,7 +22,6 @@ enum { VAR_DATA = -3, VAR_NONE = -2, VAR_TIME = -1 };
 enum { DIR_BACKWARD, DIR_FORWARD };
 enum { CHANGE_PERCENT, CHANGE_ABSOLUTE, CHANGE_LOG_RETURN };
 enum { SAMPLE_ALL, SAMPLE_DISTANCE, SAMPLE_MONTH, SAMPLE_YEAR };
-enum { FAMILY_POLYNOMIAL, FAMILY_EXPONENTIAL, FAMILY_LOGARITHMIC };
 
 typedef struct {
     int y, x;                 /* VAR_TIME, VAR_DATA, or StockList index */
@@ -227,384 +227,6 @@ static double data_value(const DataSeries *data, int i, int change, int days,
     return j>=data->count?NAN:change_value(now,data->points[j].value,change_type);
 }
 
-static int solve(double *a, double *b, int n, double *out)
-{
-    for (int c = 0; c < n; c++) {
-        int p = c;
-        for (int r = c + 1; r < n; r++) if (fabs(a[r*n+c]) > fabs(a[p*n+c])) p = r;
-        if (fabs(a[p*n+c]) < 1e-12) return -1;
-        if (p != c) for (int k = c; k < n; k++) { double t=a[c*n+k]; a[c*n+k]=a[p*n+k]; a[p*n+k]=t; }
-        if (p != c) { double t=b[c]; b[c]=b[p]; b[p]=t; }
-        double q=a[c*n+c]; for (int k=c;k<n;k++) a[c*n+k]/=q; b[c]/=q;
-        for (int r=0;r<n;r++) if (r!=c) { q=a[r*n+c]; for(int k=c;k<n;k++) a[r*n+k]-=q*a[c*n+k]; b[r]-=q*b[c]; }
-    }
-    memcpy(out,b,(size_t)n*sizeof *out); return 0;
-}
-
-static unsigned model_terms(const RegressionModel *model,int degree)
-{
-    return model->terms?model->terms:(1u<<(degree+1))-1;
-}
-
-static int term_indices(unsigned mask,int indices[26])
-{
-    int count=0;for(int j=0;j<26;j++)if(mask&(1u<<j))indices[count++]=j;
-    return count;
-}
-
-static int fit_terms(const double *x, const double *y, int n, int degree, int logy,unsigned terms,int standardize,
-                      double *pred, double *score, RegressionModel *model)
-{
-    int indices[26],p=term_indices(terms,indices); if (!p || n <= p) return -1;
-    double mean=0, sd=0; for(int i=0;i<n;i++) mean+=x[i]; mean/=n;
-    for(int i=0;i<n;i++){double d=x[i]-mean;sd+=d*d;} sd=sqrt(sd/n); if(sd==0){if(degree)return -1;sd=1;}
-    if(!standardize){mean=0;sd=1;}
-    double *a=calloc((size_t)p*p,sizeof *a), *b=calloc((size_t)p,sizeof *b), *coef=calloc((size_t)p,sizeof *coef);
-    if(!a||!b||!coef){free(a);free(b);free(coef);return -1;}
-    double ym=0; for(int i=0;i<n;i++){if(logy&&y[i]<=0){free(a);free(b);free(coef);return -1;}ym+=logy?log(y[i]):y[i];} ym/=n;
-    int constant_y=1;
-    for(int i=1;i<n;i++)if(y[i]!=y[0]){constant_y=0;break;}
-    if(constant_y)ym=logy?log(y[0]):y[0];
-    double sst=0; for(int i=0;i<n;i++){double z=(x[i]-mean)/sd, powv[51];powv[0]=1;for(int k=1;k<=2*degree;k++)powv[k]=powv[k-1]*z;double yy=logy?log(y[i]):y[i];for(int r=0;r<p;r++){b[r]+=powv[indices[r]]*yy;for(int c=0;c<p;c++)a[r*p+c]+=powv[indices[r]+indices[c]];}double d=yy-ym;sst+=d*d;}
-    if(sst==0)coef[0]=ym;
-    else if(solve(a,b,p,coef)){free(a);free(b);free(coef);return -1;}
-    double sse=0;for(int i=0;i<n;i++){double z=(x[i]-mean)/sd, v=0;for(int k=0;k<p;k++)v+=coef[k]*pow(z,indices[k]); double yy=logy?log(y[i]):y[i];double d=yy-v;sse+=d*d;pred[i]=logy?exp(v):v;}
-    *score=sst>0?1.0-(sse/(n-p))/(sst/(n-1)):NAN;
-    memset(model,0,sizeof *model);
-    model->valid=1;model->log_y=logy;model->mean=mean;model->scale=sd;
-    model->terms=terms;
-    for(int k=0;k<p;k++)model->coefficients[indices[k]]=coef[k];
-    free(a);free(b);free(coef);return 0;
-}
-
-static int fit_degree(const double *x,const double *y,int n,int degree,int logy,
-                      double *pred,double *score,RegressionModel *model)
-{
-    return fit_terms(x,y,n,degree,logy,(1u<<(degree+1))-1,1,pred,score,model);
-}
-
-static double evaluate_model(const RegressionModel *m,int degree,double x,double gradient[27])
-{
-    double input=x;
-    if(m->family==FAMILY_LOGARITHMIC){if(x<=m->shift)return NAN;input=log(x-m->shift);}
-    double z=(input-m->mean)/m->scale,powers[26];powers[0]=1;
-    for(int k=1;k<=degree;k++)powers[k]=powers[k-1]*z;
-    double value=0,derivative=0;
-    for(int k=0;k<=degree;k++) {
-        value+=m->coefficients[k]*powers[k];
-        if(k)derivative+=k*m->coefficients[k]*powers[k-1];
-    }
-    double multiplier=1;
-    if(m->family==FAMILY_EXPONENTIAL)multiplier=m->exp_sign*exp(value);
-    if(gradient) {
-        for(int k=0;k<=degree;k++)gradient[k]=multiplier*powers[k];
-        gradient[26]=m->family==FAMILY_EXPONENTIAL?1:
-            m->family==FAMILY_LOGARITHMIC?-derivative/(m->scale*(x-m->shift)):0;
-    }
-    if(m->family==FAMILY_EXPONENTIAL)return m->shift+multiplier;
-    return m->log_y?exp(value):value;
-}
-
-static double model_value(const RegressionGraph *g, double x)
-{
-    return evaluate_model(&g->model,g->degree,x,NULL);
-}
-
-static double nonlinear_system(const double *x,const double *y,int n,int degree,
-                               const RegressionModel *m,double *matrix,double *rhs)
-{
-    int indices[26],count=term_indices(model_terms(m,degree),indices),p=count+1;
-    if(matrix)memset(matrix,0,(size_t)p*p*sizeof *matrix);
-    if(rhs)memset(rhs,0,(size_t)p*sizeof *rhs);
-    double sse=0;
-    for(int i=0;i<n;i++) {
-        double gradient[27],fit=evaluate_model(m,degree,x[i],matrix?gradient:NULL);
-        if(!isfinite(fit))return INFINITY;
-        double residual=y[i]-fit;sse+=residual*residual;
-        if(matrix)for(int r=0;r<p;r++) {
-            double gr=gradient[r<count?indices[r]:26];
-            rhs[r]+=gr*residual;
-            for(int c=0;c<p;c++)matrix[r*p+c]+=gr*gradient[c<count?indices[c]:26];
-        }
-    }
-    return sse;
-}
-
-/* Damped nonlinear least squares, with several shift/sign starting points. */
-static int fit_family(const double *x,const double *y,int n,int degree,int logy,unsigned terms,int family,int standardize,
-                      double *pred,double *score,RegressionModel *model)
-{
-    if(!family||degree==0)return fit_terms(x,y,n,degree,logy,terms,standardize,pred,score,model);
-    int indices[26],count=term_indices(terms,indices),p=count+1;
-    if(n<=p)return -1;
-    double xmin=x[0],xmax=x[0],ymin=y[0],ymax=y[0],ym=0;
-    for(int i=0;i<n;i++){xmin=fmin(xmin,x[i]);xmax=fmax(xmax,x[i]);ymin=fmin(ymin,y[i]);ymax=fmax(ymax,y[i]);ym+=y[i];}
-    if(xmax==xmin)return -1;
-    ym/=n;
-    double xr=xmax-xmin,yr=fmax(ymax-ymin,1e-6),best=INFINITY;
-    double *tx=malloc((size_t)n*sizeof *tx),*ty=malloc((size_t)n*sizeof *ty),*initial=malloc((size_t)n*sizeof *initial);
-    if(!tx||!ty||!initial){free(tx);free(ty);free(initial);return -1;}
-    for(int start=0;start<(family==FAMILY_EXPONENTIAL?6:3);start++) {
-        double factor=start%3==0?.05:start%3==1?.5:2;
-        int sign=start<3?1:-1;
-        double shift=family==FAMILY_LOGARITHMIC?xmin-factor*xr:sign>0?ymin-factor*yr:ymax+factor*yr;
-        for(int i=0;i<n;i++){
-            tx[i]=family==FAMILY_LOGARITHMIC?log(x[i]-shift):x[i];
-            ty[i]=family==FAMILY_EXPONENTIAL?log(sign*(y[i]-shift)):y[i];
-        }
-        RegressionModel current;double unused;
-        if(fit_terms(tx,ty,n,degree,0,terms,standardize,initial,&unused,&current))continue;
-        current.family=family;current.shift=shift;current.exp_sign=sign;
-        double error=nonlinear_system(x,y,n,degree,&current,NULL,NULL),lambda=.001;
-        for(int iter=0;iter<180;iter++) {
-            double matrix[27*27],rhs[27],delta[27];
-            nonlinear_system(x,y,n,degree,&current,matrix,rhs);
-            int finite=1;for(int j=0;j<p*p;j++)if(!isfinite(matrix[j]))finite=0;
-            for(int j=0;j<p;j++)if(!isfinite(rhs[j]))finite=0;
-            if(!finite)break;
-            for(int j=0;j<p;j++)matrix[j*p+j]+=lambda*fmax(matrix[j*p+j],1e-12);
-            if(solve(matrix,rhs,p,delta)){lambda*=10;if(lambda>1e15)break;continue;}
-            RegressionModel candidate=current;
-            for(int j=0;j<count;j++)candidate.coefficients[indices[j]]+=delta[j];
-            candidate.shift+=delta[count];
-            double next=family==FAMILY_LOGARITHMIC&&candidate.shift>=xmin?INFINITY:
-                nonlinear_system(x,y,n,degree,&candidate,NULL,NULL);
-            if(isfinite(next)&&next<error) {
-                double improvement=error-next;current=candidate;error=next;lambda=fmax(lambda*.3,1e-12);
-                if(improvement<1e-11*fmax(error,1e-20))break;
-            } else {lambda*=10;if(lambda>1e15)break;}
-        }
-        if(isfinite(error)&&error<best){best=error;*model=current;}
-    }
-    free(tx);free(ty);free(initial);
-    if(!isfinite(best))return -1;
-    double sst=0;for(int i=0;i<n;i++){sst+=(y[i]-ym)*(y[i]-ym);pred[i]=evaluate_model(model,degree,x[i],NULL);}
-    *score=sst>0?1-(best/(n-p))/(sst/(n-1)):NAN;
-    return 0;
-}
-
-/* Regularized incomplete beta, used for two-sided Student t probabilities. */
-static double beta_fraction(double a,double b,double x)
-{
-    double c=1,d=1-(a+b)*x/(a+1),h;
-    if(fabs(d)<1e-300)d=1e-300;
-    d=1/d;h=d;
-    for(int m=1;m<=10000;m++) {
-        double aa=m*(b-m)*x/((a+2*m-1)*(a+2*m));
-        d=1+aa*d;if(fabs(d)<1e-300)d=1e-300;
-        c=1+aa/c;if(fabs(c)<1e-300)c=1e-300;
-        d=1/d;h*=d*c;
-        aa=-(a+m)*(a+b+m)*x/((a+2*m)*(a+2*m+1));
-        d=1+aa*d;if(fabs(d)<1e-300)d=1e-300;
-        c=1+aa/c;if(fabs(c)<1e-300)c=1e-300;
-        d=1/d;double delta=d*c;h*=delta;
-        if(fabs(delta-1)<3e-14)return h;
-    }
-    return NAN;
-}
-
-static double t_probability(double t,int df)
-{
-    if(df<=0||isnan(t))return NAN;
-    if(isinf(t))return 0;
-    if(t==0)return 1;
-    double x=df/(df+t*t),a=df/2.0,b=.5;
-    if(x<=0)return 0;
-    double front=exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*log(x)+b*log1p(-x));
-    double p=x<(a+1)/(a+b+2)?front*beta_fraction(a,b,x)/a:
-        1-front*beta_fraction(b,a,1-x)/b;
-    return isfinite(p)?fmax(0,fmin(1,p)):NAN;
-}
-
-typedef struct { double se[26],t[26],p[26]; int df; } CoefficientTests;
-
-static double f_probability(double value,int numerator_df,int denominator_df)
-{
-    if(numerator_df<=0||denominator_df<=0||isnan(value)||value<0)return NAN;
-    if(isinf(value))return 0;
-    if(value==0)return 1;
-    double x=1/(1+((double)numerator_df/denominator_df)*value);
-    if(x<=0)return 0;
-    if(x>=1)return 1;
-    double a=denominator_df/2.0,b=numerator_df/2.0;
-    double front=exp(lgamma(a+b)-lgamma(a)-lgamma(b)+a*log(x)+b*log1p(-x));
-    double probability=x<(a+1)/(a+b+2)?front*beta_fraction(a,b,x)/a:
-        1-front*beta_fraction(b,a,1-x)/b;
-    return isfinite(probability)?fmax(0,fmin(1,probability)):NAN;
-}
-
-static int overall_f_test(const RegressionGraph *g,double *value,double *probability,int *df1,int *df2)
-{
-    int indices[26],count=term_indices(model_terms(&g->model,g->degree),indices);
-    *value=*probability=NAN;*df1=count-1;*df2=g->count-count;
-    if(g->model.family||*df1<=0||*df2<=0)return -1;
-    double mean=0;
-    for(int i=0;i<g->count;i++) {
-        if(!isfinite(g->y[i])||(g->model.log_y&&g->y[i]<=0))return -1;
-        mean+=g->model.log_y?log(g->y[i]):g->y[i];
-    }
-    mean/=g->count;double sse=0,sst=0;
-    for(int i=0;i<g->count;i++) {
-        double y=g->model.log_y?log(g->y[i]):g->y[i];
-        double z=(g->x[i]-g->model.mean)/g->model.scale;
-        double fit=g->model.coefficients[g->degree];
-        for(int j=g->degree-1;j>=0;j--)fit=fit*z+g->model.coefficients[j];
-        sse+=(y-fit)*(y-fit);sst+=(y-mean)*(y-mean);
-    }
-    if(!isfinite(sse)||!isfinite(sst)||sst<=0)return -1;
-    *value=sse==0?INFINITY:(fmax(0,sst-sse)/ *df1)/(sse/ *df2);
-    *probability=f_probability(*value,*df1,*df2);
-    return isnan(*probability)?-1:0;
-}
-
-/* Tests use the same centered/scaled polynomial basis as the fitted model. */
-static int coefficient_tests(const double *x,const double *y,int n,int degree,
-                             const RegressionModel *model,CoefficientTests *out)
-{
-    int indices[26],count=term_indices(model_terms(model,degree),indices);out->df=n-count;
-    for(int j=0;j<26;j++)out->se[j]=out->t[j]=out->p[j]=NAN;
-    if(model->family) {
-        int p=count+1;out->df=n-p;if(out->df<=0)return -1;
-        double matrix[27*27],rhs[27];double sse=nonlinear_system(x,y,n,degree,model,matrix,rhs);
-        if(!isfinite(sse))return -1;
-        for(int j=0;j<count;j++) {
-            double copy[27*27],unit[27]={0},inverse[27];memcpy(copy,matrix,(size_t)p*p*sizeof *copy);unit[j]=1;
-            if(solve(copy,unit,p,inverse)||!isfinite(inverse[j])||inverse[j]<0)return -1;
-            int k=indices[j];out->se[k]=sqrt(sse/out->df*inverse[j]);
-            out->t[k]=out->se[k]>0?model->coefficients[k]/out->se[k]:model->coefficients[k]==0?NAN:copysign(INFINITY,model->coefficients[k]);
-            out->p[k]=t_probability(out->t[k],out->df);
-        }
-        return 0;
-    }
-    if(out->df<=0)return -1;
-    double matrix[26*26]={0},sse=0;
-    for(int i=0;i<n;i++) {
-        if(model->log_y&&y[i]<=0)return -1;
-        double z=(x[i]-model->mean)/model->scale,powers[51];powers[0]=1;
-        for(int j=1;j<=2*degree;j++)powers[j]=powers[j-1]*z;
-        double fit=0;
-        for(int r=0;r<count;r++) {
-            fit+=model->coefficients[indices[r]]*powers[indices[r]];
-            for(int c=0;c<count;c++)matrix[r*count+c]+=powers[indices[r]+indices[c]];
-        }
-        double residual=(model->log_y?log(y[i]):y[i])-fit;sse+=residual*residual;
-    }
-    for(int j=0;j<count;j++) {
-        double copy[26*26],rhs[26]={0},inverse[26];
-        memcpy(copy,matrix,(size_t)count*count*sizeof *copy);rhs[j]=1;
-        if(solve(copy,rhs,count,inverse)||inverse[j]<0||!isfinite(inverse[j]))return -1;
-        int k=indices[j];out->se[k]=sqrt(sse/out->df*inverse[j]);
-        double beta=model->coefficients[k];
-        if(out->se[k]==0)out->t[k]=beta==0?NAN:copysign(INFINITY,beta);
-        else out->t[k]=beta/out->se[k];
-        out->p[k]=t_probability(out->t[k],out->df);
-    }
-    return 0;
-}
-
-typedef struct {
-    int count,df,indices[27];
-    double covariance[27*27],sigma2,critical,level;
-} MeanConfidence;
-
-static double confidence_critical(double level,int df)
-{
-    if(!isfinite(level)||level<=0||level>=100||df<=0)return NAN;
-    double tail=1-level/100,lo=0,hi=1;
-    while(t_probability(hi,df)>tail&&hi<1e16)hi*=2;
-    if(!isfinite(t_probability(hi,df))||t_probability(hi,df)>tail)return NAN;
-    for(int i=0;i<80;i++) {
-        double mid=(lo+hi)/2,p=t_probability(mid,df);
-        if(!isfinite(p))return NAN;
-        if(p>tail)lo=mid;else hi=mid;
-    }
-    return (lo+hi)/2;
-}
-
-/* Full covariance, including cross terms and the nonlinear shift. The
- * Jacobian of a log-y polynomial is on the fitted log-response scale. */
-static int confidence_prepare(const RegressionGraph *g,double level,MeanConfidence *out)
-{
-    memset(out,0,sizeof *out);
-    if(!g->model.valid||g->model.scale<=0||!isfinite(g->model.scale))return -1;
-    int p=term_indices(model_terms(&g->model,g->degree),out->indices);
-    if(g->model.family)out->indices[p++]=26;
-    out->count=p;out->df=g->count-p;out->level=level;
-    out->critical=confidence_critical(level,out->df);
-    if(!isfinite(out->critical))return -1;
-    double matrix[27*27]={0},scales[27];long double sse=0;
-    for(int i=0;i<g->count;i++) {
-        double gradient[27],fit=evaluate_model(&g->model,g->degree,g->x[i],gradient),response=g->y[i];
-        if(g->model.log_y) {
-            if(response<=0)return -1;
-            response=log(response);fit=0;
-            for(int j=0;j<p;j++)fit+=g->model.coefficients[out->indices[j]]*gradient[out->indices[j]];
-        }
-        if(!isfinite(fit)||!isfinite(response))return -1;
-        long double residual=(long double)response-fit;sse+=residual*residual;
-        for(int r=0;r<p;r++)for(int c=0;c<p;c++)
-            matrix[r*p+c]+=gradient[out->indices[r]]*gradient[out->indices[c]];
-    }
-    out->sigma2=(double)(sse/out->df);if(!isfinite(out->sigma2))return -1;
-    for(int r=0;r<p;r++) {
-        if(!isfinite(matrix[r*p+r])||matrix[r*p+r]<=0)return -1;
-        scales[r]=sqrt(matrix[r*p+r]);
-    }
-    for(int r=0;r<p;r++)for(int c=0;c<p;c++)matrix[r*p+c]/=scales[r]*scales[c];
-    for(int c=0;c<p;c++) {
-        double copy[27*27],unit[27]={0},inverse[27];
-        memcpy(copy,matrix,(size_t)p*p*sizeof *copy);unit[c]=1;
-        if(solve(copy,unit,p,inverse)||inverse[c]<0)return -1;
-        for(int r=0;r<p;r++) {
-            double value=out->sigma2*inverse[r]/scales[r]/scales[c];
-            if(!isfinite(value))return -1;
-            out->covariance[r*p+c]=value;
-        }
-    }
-    return 0;
-}
-
-static int response_interval(const RegressionGraph *g,const MeanConfidence *ci,double x,int prediction,double *lower,double *upper)
-{
-    double gradient[27],fit=evaluate_model(&g->model,g->degree,x,gradient);
-    if(!g->model.log_y&&!isfinite(fit))return -1;
-    long double variance=0,magnitude=0;
-    for(int r=0;r<ci->count;r++)for(int c=0;c<ci->count;c++) {
-        long double value=(long double)gradient[ci->indices[r]]*ci->covariance[r*ci->count+c]*gradient[ci->indices[c]];
-        variance+=value;magnitude+=fabsl(value);
-    }
-    if(!isfinite((double)variance)||variance < -1e-12L*magnitude)return -1;
-    if(variance<0)variance=0;
-    if(g->model.log_y) {
-        /* Predict an individual response on the log scale, then transform
-         * both limits. Mean intervals instead use the lognormal mean
-         * correction and uncertainty in sigma2 (independent of beta). */
-        fit=0;
-        for(int j=0;j<ci->count;j++)fit+=g->model.coefficients[ci->indices[j]]*gradient[ci->indices[j]];
-        if(prediction)variance+=ci->sigma2;
-        else {
-            fit+=ci->sigma2/2;
-            variance+=(long double)ci->sigma2*ci->sigma2/(2*ci->df);
-        }
-        double half=ci->critical*sqrt((double)variance);
-        *lower=exp(fit-half);*upper=exp(fit+half);
-    } else {
-        double half=ci->critical*sqrt((double)variance+(prediction?ci->sigma2:0));
-        *lower=fit-half;*upper=fit+half;
-    }
-    return isfinite(*lower)&&isfinite(*upper)?0:-1;
-}
-
-static int confidence_interval(const RegressionGraph *g,const MeanConfidence *ci,double x,double *lower,double *upper)
-{
-    return response_interval(g,ci,x,0,lower,upper);
-}
-
-static int prediction_interval(const RegressionGraph *g,const MeanConfidence *ci,double x,double *lower,double *upper)
-{
-    return response_interval(g,ci,x,1,lower,upper);
-}
-
 /* Older files saved only predicted observations. Recover their polynomial,
  * checking both ordinary and log-y fits against those saved predictions. */
 static int recover_model(RegressionGraph *g)
@@ -614,7 +236,7 @@ static int recover_model(RegressionGraph *g)
     double best_error=INFINITY;
     for(int logy=0;logy<=1;logy++) {
         RegressionModel trial; double score;
-        if(fit_degree(g->x,g->fit,g->count,g->degree,logy,pred,&score,&trial))continue;
+        if(regression_fit(g->x,g->fit,g->count,g->degree,logy,(1u<<(g->degree+1))-1,FAMILY_POLYNOMIAL,1,pred,&score,&trial))continue;
         double error=0;
         for(int i=0;i<g->count;i++) {
             double residual=(pred[i]-g->fit[i])/fmax(1.0,fabs(g->fit[i]));
@@ -656,7 +278,7 @@ static int save_graph(const StockList *l, const RegressionGraph *g, const char *
             g->x_is_time, g->y_is_time, g->x_time_unit, g->y_time_unit,
             g->x_epoch, g->y_epoch);
     fprintf(f,"%.17g\n",g->significance);
-    fprintf(f,"%u\n",model_terms(&g->model,g->degree));
+    fprintf(f,"%u\n",regression_model_terms(&g->model,g->degree));
     fprintf(f,"%d %.17g %d\n",g->model.family,g->model.shift,g->model.exp_sign);
     fprintf(f,"%d %.17g %.17g\n",g->model.log_y,g->model.mean,g->model.scale);
     for(int k=0;k<=g->degree;k++)fprintf(f,"%.17g\n",g->model.coefficients[k]);
@@ -939,9 +561,9 @@ static int apply_significance(const double *x,const double *y,int n,const Spec *
 {
     if(sp->significance<=0||(sp->exact_degree&&(!sp->remove_intermediate||*degree<=1)))return 0;
     while(*degree>0) {
-        CoefficientTests tests;
-        if(coefficient_tests(x,y,n,*degree,model,&tests))return sp->exact_degree?0:-1;
-        unsigned terms=model_terms(model,*degree);int drop=-1;double worst=-1;
+        RegressionCoefficientTests tests;
+        if(regression_coefficient_tests(x,y,n,*degree,model,&tests))return sp->exact_degree?0:-1;
+        unsigned terms=regression_model_terms(model,*degree);int drop=-1;double worst=-1;
         int last=sp->exact_degree?*degree-1:*degree;
         for(int j=sp->remove_intermediate?1:*degree;j<=last;j++) {
             if(!(terms&(1u<<j)))continue;
@@ -957,7 +579,7 @@ static int apply_significance(const double *x,const double *y,int n,const Spec *
         int reduced=*degree;
         while(reduced>0&&!(terms&(1u<<reduced)))reduced--;
         RegressionModel candidate;double candidate_score;
-        if(fit_family(x,y,n,reduced,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,pred,&candidate_score,&candidate))return sp->exact_degree?0:-1;
+        if(regression_fit(x,y,n,reduced,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,pred,&candidate_score,&candidate))return sp->exact_degree?0:-1;
         *degree=reduced;*model=candidate;*score=candidate_score;
     }
     return 0;
@@ -1007,7 +629,7 @@ static int exhaustive_search(const double *x, const double *y, int n, const Spec
         RegressionModel trial_model;
         unsigned terms=1u; /* Only intercept */
         
-        if(fit_family(x,y,n,0,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
+        if(regression_fit(x,y,n,0,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
                      trial_fit,&score,&trial_model)) {
             free(trial_fit);free(candidates);
             *out_candidates=NULL;*out_count=0;
@@ -1062,7 +684,7 @@ static int exhaustive_search(const double *x, const double *y, int n, const Spec
         
         double score;
         RegressionModel trial_model;
-        if(fit_family(x,y,n,degree,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
+        if(regression_fit(x,y,n,degree,!sp->family&&sp->log_y,terms,sp->family,sp->standardize,
                      trial_fit,&score,&trial_model)) {
             free(trial_fit);
             continue;
@@ -1258,7 +880,7 @@ static int generate(const Settings *cfg, DrawFn draw, void *ctx, const StockList
         double full_score;
         unsigned full_terms=(1u<<(sp->max_degree+1))-1;
         
-        if(fit_family(x,y,n,sp->max_degree,!sp->family&&sp->log_y,full_terms,sp->family,
+        if(regression_fit(x,y,n,sp->max_degree,!sp->family&&sp->log_y,full_terms,sp->family,
                      sp->standardize,full_fit,&full_score,&full_model)) {
             free(full_fit);free(x);free(y);
             snprintf(err,errn,"Cannot fit full model for exhaustive search");
@@ -1364,7 +986,7 @@ static int generate(const Settings *cfg, DrawFn draw, void *ctx, const StockList
         int found=0,failed_tests=0;
         for(int d=sp->exact_degree||sp->max_degree==0?sp->max_degree:1;d<=sp->max_degree;d++) {
             double score;RegressionModel trial_model;int degree=d;
-            if(fit_family(x,y,n,d,!sp->family&&sp->log_y,(1u<<(d+1))-1,sp->family,sp->standardize,trial,&score,&trial_model))continue;
+            if(regression_fit(x,y,n,d,!sp->family&&sp->log_y,(1u<<(d+1))-1,sp->family,sp->standardize,trial,&score,&trial_model))continue;
             if(apply_significance(x,y,n,sp,&degree,trial,&score,&trial_model)){failed_tests++;continue;}
             if(!found||(isfinite(score)&&(!isfinite(bestscore)||score>bestscore))) {
                 found=1;bestscore=score;bestd=degree;best_model=trial_model;memcpy(best,trial,(size_t)n*sizeof*best);
@@ -1735,7 +1357,7 @@ static void draw_curve(const RegressionGraph *g, unsigned char *mask, int width,
     int have_previous=0;
     for(int i=0;i<=samples;i++) {
         double x=lo+(hi-lo)*i/samples;
-        double y=model_value(g,x);
+        double y=regression_model_value(g,x);
         double px=(x-xmin)/(xmax-xmin)*(width*2-1);
         double py=(ymax-y)/(ymax-ymin)*(height*4-1);
         if(!isfinite(py)){have_previous=0;continue;}
@@ -1745,7 +1367,7 @@ static void draw_curve(const RegressionGraph *g, unsigned char *mask, int width,
     }
 }
 
-static void draw_confidence(const RegressionGraph *g,const MeanConfidence *ci,unsigned char *mask,
+static void draw_confidence(const RegressionGraph *g,const RegressionConfidence *ci,unsigned char *mask,
                             int width,int height,double xmin,double xmax,double ymin,double ymax,
                             double data_xmin,double data_xmax)
 {
@@ -1753,7 +1375,7 @@ static void draw_confidence(const RegressionGraph *g,const MeanConfidence *ci,un
     int previous=0,samples=width*8;if(lo>hi)return;
     for(int i=0;i<=samples;i++) {
         double x=lo+(hi-lo)*i/samples,bounds[2];
-        if(confidence_interval(g,ci,x,&bounds[0],&bounds[1])){previous=0;continue;}
+        if(regression_confidence_interval(g,ci,x,&bounds[0],&bounds[1])){previous=0;continue;}
         double px=(x-xmin)/(xmax-xmin)*(width*2-1);
         for(int j=0;j<2;j++) {
             double py=(ymax-bounds[j])/(ymax-ymin)*(height*4-1);
@@ -1971,11 +1593,11 @@ static void graph_panel(const Settings *cfg,const char *title,char lines[][512],
 static void graph_tests(const Settings *cfg,const RegressionGraph *g,
                         int left,int top,int right,int bot,int *offset,int *pan,GraphPanel *box)
 {
-    CoefficientTests tests;int valid=!coefficient_tests(g->x,g->y,g->count,g->degree,&g->model,&tests);
+    RegressionCoefficientTests tests;int valid=!regression_coefficient_tests(g->x,g->y,g->count,g->degree,&g->model,&tests);
     char lines[40][512];int p_column[40]={0},p_color[40]={0};int n=0;
     snprintf(lines[n++],256,"%s, two-sided H0: beta = 0",g->model.family?"nonlinear least squares (approximate t-tests)":"ordinary OLS");
-    int indices[26];unsigned terms=model_terms(&g->model,g->degree);
-    int count=term_indices(terms,indices);
+    int indices[26];unsigned terms=regression_model_terms(&g->model,g->degree);
+    int count=regression_term_indices(terms,indices);
     snprintf(lines[n++],256,"%d observations, %d residual degrees of freedom",g->count,g->count-count-(g->model.family?1:0));
     if(g->model.mean==0&&g->model.scale==1) {
         if(g->model.family==FAMILY_LOGARITHMIC)snprintf(lines[n++],256,"z = ln(x - (%.12g)) (unstandardized basis)",g->model.shift);
@@ -2029,7 +1651,7 @@ static void graph_tests(const Settings *cfg,const RegressionGraph *g,
     if(g->model.family==FAMILY_POLYNOMIAL) {
         snprintf(lines[n++],256,"Overall F-test: all retained slopes = 0%s",g->model.log_y?" (log-y space)":"");
         double f,p;int df1,df2;
-        if(valid&&!overall_f_test(g,&f,&p,&df1,&df2)) {
+        if(valid&&!regression_overall_f_test(g,&f,&p,&df1,&df2)) {
             int prefix=snprintf(lines[n],256,"F(%d, %d) = %.7g; p = ",df1,df2,f);
             p_column[n]=prefix;snprintf(lines[n]+prefix,256-(size_t)prefix,"%.7g",p);
             if(g->significance>0)p_color[n]=p<=g->significance?1:-1;
@@ -2138,7 +1760,7 @@ static void histogram_cells(const Settings *cfg,const unsigned char *bars,const 
 
 static int make_residuals(const RegressionGraph *g,double *values,ResidualStats *stats)
 {
-    int indices[26],parameters=term_indices(model_terms(&g->model,g->degree),indices)+(g->model.family?1:0);
+    int indices[26],parameters=regression_term_indices(regression_model_terms(&g->model,g->degree),indices)+(g->model.family?1:0);
     for(int i=0;i<g->count;i++) {
         if(g->model.log_y) {
             if(g->y[i]<=0)return -1;
@@ -2313,7 +1935,7 @@ static int conditional_distribution(const RegressionGraph *g,double x,Conditiona
     if(!residuals)return -1;
     int failed=make_residuals(g,residuals,&stats);free(residuals);
     if(failed||!isfinite(stats.sigma2)||stats.sigma2<0)return -1;
-    double mean=model_value(g,x),variance=stats.sigma2;
+    double mean=regression_model_value(g,x),variance=stats.sigma2;
     if(g->model.log_y) {
         double z=(x-g->model.mean)/g->model.scale,eta=g->model.coefficients[g->degree];
         for(int j=g->degree-1;j>=0;j--)eta=eta*z+g->model.coefficients[j];
@@ -2484,10 +2106,10 @@ static void conditional_view(const Settings *cfg,const RegressionGraph *g,const 
             if(k==3||k==KEY_EOF)break;
             if(k==KEY_ESC){asking_prediction=0;continue;}
             if(k=='\r'||k=='\n') {
-                double level,low,high;MeanConfidence ci;
+                double level,low,high;RegressionConfidence ci;
                 if(parse_finite_input(input,1,&level)||level<=0||level>=100)
                     snprintf(error,sizeof error,"Enter a percentage greater than 0 and less than 100");
-                else if(confidence_prepare(g,level,&ci)||prediction_interval(g,&ci,d->x,&low,&high))
+                else if(regression_confidence_prepare(g,level,&ci)||regression_prediction_interval(g,&ci,d->x,&low,&high))
                     snprintf(error,sizeof error,"Cannot calculate a reliable prediction interval for this model");
                 else {
                     prediction_low=low;prediction_high=high;prediction_level=level;
@@ -2559,7 +2181,7 @@ void regression_view(const Settings *cfg, RegressionGraph *g, const StockList *l
     int has_click=0,show_fit=1,panel=0,panel_offset=0,panel_pan=0;
     int saving=0;char save_name[256]="",save_error[128]="",save_status[320]="";
     static char last_confidence[32]="95";
-    int show_bands=0,asking_confidence=0;MeanConfidence confidence={0};
+    int show_bands=0,asking_confidence=0;RegressionConfidence confidence={0};
     char confidence_input[32]="",confidence_error[128]="";size_t confidence_cursor=0;
     int asking_x=0;char x_input[64]="",x_error[128]="";size_t x_cursor=0;
     size_t save_cursor=0;
@@ -2575,7 +2197,7 @@ void regression_view(const Settings *cfg, RegressionGraph *g, const StockList *l
     /* Include between-observation curvature in the initial vertical range. */
     for(int i=0;i<=2048;i++) {
         double x=data_xmin+(data_xmax-data_xmin)*i/2048;
-        double y=model_value(g,x);
+        double y=regression_model_value(g,x);
         if(!isfinite(y))continue;
         if(y<data_ymin)data_ymin=y;
         if(y>data_ymax)data_ymax=y;
@@ -2722,7 +2344,7 @@ void regression_view(const Settings *cfg, RegressionGraph *g, const StockList *l
                 if(*end=='%'){end++;while(isspace((unsigned char)*end))end++;}
                 if(end==confidence_input||*end||errno||!isfinite(level)||level<=0||level>=100)
                     snprintf(confidence_error,sizeof confidence_error,"Enter a percentage greater than 0 and less than 100");
-                else if(confidence_prepare(g,level,&confidence))
+                else if(regression_confidence_prepare(g,level,&confidence))
                     snprintf(confidence_error,sizeof confidence_error,"Cannot calculate reliable mean confidence intervals for this model");
                 else {
                     snprintf(last_confidence,sizeof last_confidence,"%s",confidence_input);

@@ -4,7 +4,7 @@ Candles is a keyboard-driven terminal application for viewing stock candlesticks
 
 This manual describes **version 4.1**.
 
-Version 4.1 fixes duplicate models in the candidate picker and makes Esc cancel selection cleanly back to the stock viewer. Run `make check` for the model-selection regression checks.
+Version 4.1 fixes duplicate models in the candidate picker and makes Esc cancel selection cleanly back to the stock viewer. See [CHANGES.md](CHANGES.md) for the changelog.
 
 ## Contents
 
@@ -23,7 +23,7 @@ Version 4.1 fixes duplicate models in the candidate picker and makes Esc cancel 
 - [Configuration and persistence](#configuration-and-persistence)
 - [Troubleshooting](#troubleshooting)
 - [Current limitations](#current-limitations)
-- [Source layout](#source-layout)
+- [Development](#development)
 
 ## Requirements
 
@@ -42,7 +42,7 @@ The code uses POSIX terminal and process APIs; there is no native Windows or gra
 
 ## Build and launch
 
-Run from this version's directory:
+Run from the repository directory:
 
 ```sh
 make
@@ -55,6 +55,8 @@ To rebuild all C objects:
 make clean
 make
 ```
+
+Run the automated checks with `make check`; see [TESTING_GUIDE.md](TESTING_GUIDE.md) for coverage and manual checks.
 
 Run the program in a terminal, not through an output pipe. Choose data folders inside the application with `f`; there is no command-line CSV/folder selection interface.
 
@@ -130,7 +132,7 @@ stock-data/
 | `~/.config/candles/views.conf` | Per-ticker chart position, scales, period, and indicator visibility. |
 | `~/.config/candles/graphs.conf` | Last regression form selections and options. |
 
-**Version directories share the same configuration and selected data folder.** Running an older executable does not isolate its settings or CSVs. Keep separate copies if you need fully independent test environments. Newer graph/configuration formats may not be understood by older executables.
+**Different checkouts and older executables share the same configuration and selected data folder.** Git versions the source; it does not isolate settings or CSVs. Use separate copies of data and a separate `HOME` when you need independent test environments. Newer graph/configuration formats may not be understood by older executables.
 
 ## Stock CSV format
 
@@ -378,10 +380,10 @@ Stock values are always the **daily CSV closes**. Choosing weekly candles in the
 | y/x calculate changes using | Separate controls for each axis: `all observations` uses the full original series for change endpoints; `sampled points` uses the dates retained by point sampling. Active when that axis is a change and point sampling applies thinning. With all eligible dates selected, the original series is used; saved choices become active again when thinning is enabled. |
 | Minimum sample distance | The independent 1–3650-day distance used by minimum-distance sampling. |
 | `log y`, `log x` | Natural logarithms, available for non-Time levels when change mode is off. |
-| Maximum polynomial degree | Accepts 0–25. A value of 0 fits only a constant; otherwise fit degrees 1 through the selected maximum. |
+| Maximum polynomial degree | Accepts 0–25. A value of 0 requests only a constant; otherwise search subsets across degrees 1 through the selected maximum. High degrees can make exhaustive search impractical. |
 | Fit exactly this degree | Available at every degree, including 0 and 1. Fit only the chosen degree and retain its highest power. If intermediate-term removal is also checked, insignificant lower powers may be removed and the model refitted while the highest power stays. If the requested model cannot be fitted, report an error rather than substitute a different degree. |
-| Significance alpha | Optional cutoff between 0 and 1, e.g. `0.05`. Delete the field contents to retain the adjusted-R² rule alone. |
-| Remove insignificant intermediate terms | Optional, off by default. With significance enabled, remove the eligible failing slope term with the largest p-value, refit, and repeat. In exact-degree mode only powers below the chosen highest power are eligible. The intercept is retained. |
+| Significance alpha | Optional cutoff between 0 and 1, e.g. `0.05`. Colors the coefficient-test p-values. Gates term removal only in exact-degree mode; exhaustive selection uses Cp and AIC regardless of alpha. |
+| Remove insignificant intermediate terms | Optional, off by default. In exact-degree mode with significance enabled, remove the failing lower slope term with the largest p-value, refit, and repeat. The intercept and chosen highest power stay. Exhaustive mode searches subsets independently of this checkbox. |
 | Model family | Polynomial (default), shifted exponential, or shifted logarithmic. The latter two support levels and changes on either axis, with the selected polynomial degree. |
 | Standardize polynomial input | On by default. Turn off to use the input directly; for shifted logarithmic models this input is `ln(x - shift)`. The setting is remembered. Unstandardized high-degree models can be numerically unstable. |
 | Generate regression | Fit and open the graph without saving; enabled after valid axis selections. |
@@ -468,17 +470,30 @@ y = a0 + a1*x + a2*x^2 + ... + ad*x^d
 
 Log-x drops nonpositive x values; log-y drops nonpositive y values. Both filters act before accepting a pair. A constant y produces a horizontal fit with adjusted R² shown as `n/a`, since variation in y is zero.
 
-For every degree from 1 through your maximum, Candles attempts a fit and selects the valid model with the highest adjusted R². Setting the degree to 0 instead fits only an intercept (a constant), including when a shifted model family is selected. There is an intercept. Degree 1 is a straight line for the polynomial family; the maximum is a search limit unless exact-degree mode is checked. A degree `d` needs more than `d + 1` observations (one additional fitted parameter for shifted families with positive degree), and the generator currently requires at least four pairs overall.
+#### Choosing a model
 
-High-degree fitting can be numerically unreliable in this version. The score measures fit to the same observations used to select the model; there is no separate chronological prediction test, confidence interval, or causality calculation. Overlapping return windows are not independent observations.
+With **fit exactly this degree unchecked**, Candles:
 
-When significance alpha is filled in, Candles evaluates each candidate degree and applies the significance-removal rules before comparing adjusted R². By default, a highest-degree coefficient whose p-value exceeds alpha is removed, followed by a refit and another test. The process stops at a significant highest term, preserving every lower term. If no slope survives, it produces an intercept-only model. The intercept is never removed. A candidate with numerically unusable coefficient tests or a failed reduced fit is skipped, and the search continues. The usable final candidate with highest adjusted R² wins; an error is reported only if none remain. Exactly zero trailing coefficients can be removed from a constant response. Polynomial models use ordinary OLS standard errors, without Newey–West correction; shifted families use approximate nonlinear tests.
+1. Fits the full model at the maximum degree to obtain the reference residual variance for Mallows' Cp. If this fit fails or has no residual variance, generation stops with an error.
+2. Tries term subsets across degrees 1 through the maximum. Each subset includes the intercept and its highest power; intermediate powers are optional. At degree 0, only the constant model is attempted.
+3. Keeps candidates satisfying `Cp < p`, where `p` is the fitted parameter count.
+4. Offers up to ten candidates in ascending AIC order, breaking ties by fewer parameters. The first candidate is preselected; choose one with `Enter` or cancel with `Esc`.
 
-With an empty significance field, tests do not gate model selection. Exact-degree fitting also returns the requested curve when its fit succeeds, even if coefficient tests are unavailable; the `p` panel shows those results as `n/a`.
+Each menu row shows **AIC**, its difference from the best candidate, **p** (parameter count, not a p-value), and adjusted R². Similar displayed numbers can describe different term subsets; inspect the chosen equation under `p` in the graph viewer.
 
-Press `p` in the graph viewer for the equation and coefficient estimates, standard errors, t statistics, and p-values, with residual degrees of freedom `n - degree - 1`. The panel defines `z = (x - mean) / scale`: coefficients and tests refer to powers of this centered/scaled x, including any log-x transformation. With log-y, the equation models `log(y)` and the plotted fit is its exponential. Tests are exploratory because model selection used the same observations. Older saved graphs calculate the tests from their saved points and model.
+The implemented criteria are `AIC = n × ln(SSE/n) + 2p` and `Cp = SSE/σ²_full − (n − 2p)`. For polynomial log-y models, SSE uses log-y space. These are selection rules, not guarantees of predictive accuracy. Alpha and the intermediate-term-removal checkbox do not filter exhaustive candidates.
 
-When intermediate-term removal is checked, residual degrees of freedom and adjusted R² use the actual number of retained coefficients (including the intercept). Tests are recalculated after each removal. The equation omits removed powers, and the coefficient table marks them as removed. Terms refer to the displayed `z` basis. Exact-degree mode preserves the chosen highest power even when it fails significance; lower terms are removable only with the intermediate-term checkbox enabled. If their tests/refit become unavailable, exact mode keeps the last usable fit. An empty significance field bypasses removal.
+With **fit exactly this degree checked**, Candles fits only that degree and skips the candidate menu. When alpha and intermediate-term removal are both enabled, it can remove failing lower powers and refit, while retaining the intercept and chosen highest power. If coefficient tests become unavailable, exact mode keeps the last usable fit. An empty alpha bypasses term removal.
+
+There is always an intercept. A requested degree of 0 fits a constant in exact mode; the exhaustive Cp filter can reject that constant. An exactly constant response has undefined adjusted R² and is rejected by exhaustive selection's residual-variance requirement. A sparse polynomial requires more observations than retained coefficients; positive-degree shifted families need one extra parameter for the fitted shift. The generator requires at least four accepted pairs overall.
+
+Exhaustive search grows exponentially: for positive degree `d`, there are `2^(d−1)` subsets with that highest power. The current implementation stores every successful candidate's predicted observations before keeping the best ten. Start with low degrees; high values can take substantial time and memory. Exact-degree mode skips subset enumeration, although high-degree fitting can still be numerically unreliable. The displayed score measures fit to the observations used for selection; there is no separate chronological prediction test or causality calculation. Overlapping return windows are not independent observations.
+
+#### Coefficient tests
+
+Press `p` in the graph viewer for the equation, estimates, standard errors, t statistics, and p-values. Residual degrees of freedom use the actual number of retained coefficients, plus the fitted shift for a nonlinear family. Polynomial models use ordinary OLS standard errors without Newey–West correction; shifted families use approximate nonlinear tests.
+
+When standardization is on, the panel defines `z = (x - mean) / scale`; coefficients and tests refer to powers of this centered/scaled input, including any log-x transformation. When it is off, mean is 0 and scale is 1. With log-y, the fitted equation models `ln(y)` and the plotted fit is its exponential. Removed terms are omitted from the equation and marked in the table. Tests are exploratory because model selection used the same observations. Older saved graphs calculate tests from their saved points and recovered model.
 
 When a significance cutoff was chosen, the p-values use the up/green color for `p <= alpha` and down/red for `p > alpha`. Undefined tests stay uncolored. The graph stores its own cutoff; changing the generator later does not change colors in an existing graph. For version 0.2.29 graphs, the cutoff is recovered from the saved creation description when present.
 
@@ -713,36 +728,25 @@ The current error does not report a count for each exclusion reason.
 
 ### No valid regression
 
-The message currently mentions logs, but other causes include constant x, insufficient distinct x values for the attempted degrees, or numerical fitting problems. Check variation in x and try a lower maximum degree.
+Check variation in x, the number of accepted pairs, and numerical fitting at the requested degree. Exhaustive mode first needs a usable full model to estimate the Cp reference variance; it cannot continue if that baseline fit fails. Try a lower maximum degree or exact-degree mode as appropriate.
+
+`No models with Cp < p found` means no fitted candidate passed the configured selection rule. It does not by itself establish that the datasets have no relationship.
 
 ## Current limitations
 
 - Regression pairs normally require exact shared dates. The optional stock-only previous-close setting is the only date-alignment policy; it uses a preceding close, never an interpolation or future close.
 - Imported data has dates and numbers only; publication times, revisions, and within-day ordering are not modeled.
 - Closest-point sampling can span arbitrary gaps and currently does not protect against duplicate dates.
-- Month/year time spacing uses fixed 30/365-day intervals, unlike the stock viewer's calendar aggregation.
 - A change period can extend beyond its target when observations are missing.
-- Numerical fitting at high polynomial degrees is unreliable; automatic adjusted-R² selection does not resolve all numerical problems or establish forecasting performance.
+- Numerical fitting at high polynomial degrees can be unreliable. Exhaustive search has exponential time and memory costs, and selecting by AIC/Cp does not establish forecasting performance.
 - Saved graph descriptions improve interpretation but do not capture every detail needed to reproduce the original source dataset.
 - Live prices depend on external service availability and timing. Today's in-memory candle is not a saved intraday archive.
 
-## Source layout
+## Development
 
-| File | Responsibility |
-| --- | --- |
-| [main.c](main.c) | Main input loop, selections, persistence calls, live workflow. |
-| [terminal.c](terminal.c) | Terminal mode, input/mouse reports, resize handling, buffered rendering. |
-| [chart.c](chart.c) | Candles, axes, indicators, mouse inspection, measurement. |
-| [stock.c](stock.c) | Stock folder scanning, CSV parsing/writing, candle aggregation. |
-| [indicators.c](indicators.c) | Volume mean, Bollinger bands, and RSI calculations. |
-| [data.c](data.c) | Two-column data import, scanning, and loading. |
-| [regression.c](regression.c) | Regression form, sample construction, fitting, graph files, viewer. |
-| [residuals.c](residuals.c) | Residual statistics, Shapiro–Wilk normality test, density histogram. |
-| [scale.h](scale.h) | Shared vertical label spacing. |
-| [menu.c](menu.c) | Prompts, selection menus, searchable pickers. |
-| [settings.c](settings.c) | Configuration defaults and parsing. |
-| [state.c](state.c) | Saved folder/ticker, chart profiles, regression form. |
-| [grabber.c](grabber.c) | Starting and communicating with the Python helper. |
-| [grabber.py](grabber.py) | History/live requests, exchange-session state, split checks. |
-| [live.c](live.c) | Applying live readings to in-memory stock candles. |
-| [Makefile](Makefile) | Build and clean commands. |
+- [ARCHITECTURE.md](ARCHITECTURE.md): module responsibilities, data flow, and numerical API boundaries.
+- [TESTING_GUIDE.md](TESTING_GUIDE.md): automated coverage and manual verification.
+- [CHANGES.md](CHANGES.md): versioned changes.
+- [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): attribution and third-party license notices.
+
+Build products are ignored by Git. Commit source, headers, tests, and documentation; use Git history for source versions.

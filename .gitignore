@@ -1,5 +1,15 @@
-candles
+# Application and test executables
+/candles
+/tests/model_selection
+/tests/regression_math
+
+# Compiler and coverage output
 *.o
+*.d
+*.gcda
+*.gcno
+*.gcov
+
+# Python helper cache
 __pycache__/
 *.pyc
-tests/model_selection
